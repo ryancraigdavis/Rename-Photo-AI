@@ -7,9 +7,12 @@ Uses Claude's vision API to identify movies from disc/case images.
 import base64
 import os
 import re
+import shutil
+from io import BytesIO
 from pathlib import Path
 
 from anthropic import Anthropic
+from PIL import Image
 
 
 def sanitize_filename(title: str) -> str:
@@ -35,18 +38,61 @@ def sanitize_filename(title: str) -> str:
     return sanitized
 
 
-def encode_image(image_path: Path) -> str:
+def preprocess_image(image_path: Path) -> BytesIO:
     """
-    Encode an image file to base64.
+    Preprocess an image for Claude API:
+    - Resize to max 2048px dimension
+    - Convert to RGB
+    - Save as JPEG with quality=80 in memory
 
     Args:
         image_path: Path to the image file
 
     Returns:
+        BytesIO object containing the preprocessed JPEG image
+    """
+    # Open the image
+    img = Image.open(image_path)
+
+    # Convert to RGB if needed (handles PNG with transparency, RGBA, etc.)
+    if img.mode != 'RGB':
+        # If image has transparency, paste it on white background
+        if img.mode in ('RGBA', 'LA', 'PA'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'PA':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+        else:
+            img = img.convert('RGB')
+
+    # Resize if larger than 2048px in any dimension
+    max_dimension = 2048
+    if max(img.size) > max_dimension:
+        # Calculate new size maintaining aspect ratio
+        ratio = max_dimension / max(img.size)
+        new_size = tuple(int(dim * ratio) for dim in img.size)
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    # Save to BytesIO as JPEG with quality=80
+    output = BytesIO()
+    img.save(output, format='JPEG', quality=80, optimize=True)
+    output.seek(0)
+
+    return output
+
+
+def encode_image_from_bytes(image_bytes: BytesIO) -> str:
+    """
+    Encode an image from BytesIO to base64.
+
+    Args:
+        image_bytes: BytesIO object containing the image
+
+    Returns:
         Base64 encoded string of the image
     """
-    with open(image_path, 'rb') as image_file:
-        return base64.standard_b64encode(image_file.read()).decode('utf-8')
+    return base64.standard_b64encode(image_bytes.getvalue()).decode('utf-8')
 
 
 def identify_movie(client: Anthropic, image_path: Path) -> str:
@@ -62,21 +108,14 @@ def identify_movie(client: Anthropic, image_path: Path) -> str:
     """
     print(f"Analyzing {image_path.name}...")
 
-    # Determine media type from extension
-    extension = image_path.suffix.lower()
-    media_type_map = {
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.png': 'image/png',
-        '.gif': 'image/gif',
-        '.webp': 'image/webp'
-    }
-    media_type = media_type_map.get(extension, 'image/jpeg')
+    # Preprocess the image
+    print(f"  Preprocessing image...")
+    preprocessed_image = preprocess_image(image_path)
 
-    # Encode the image
-    image_data = encode_image(image_path)
+    # Encode the preprocessed image
+    image_data = encode_image_from_bytes(preprocessed_image)
 
-    # Call Claude API
+    # Call Claude API with preprocessed JPEG
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
@@ -88,7 +127,7 @@ def identify_movie(client: Anthropic, image_path: Path) -> str:
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": media_type,
+                            "media_type": "image/jpeg",
                             "data": image_data,
                         },
                     },
@@ -107,20 +146,21 @@ def identify_movie(client: Anthropic, image_path: Path) -> str:
     return title
 
 
-def process_photos(process_dir: Path, renamed_dir: Path, api_key: str) -> None:
+def process_photos(process_dir: Path, renamed_dir: Path, original_dir: Path, api_key: str) -> None:
     """
     Process all photos in the process directory.
 
     Args:
         process_dir: Directory containing photos to process
         renamed_dir: Directory to save renamed photos
+        original_dir: Directory to save original photos
         api_key: Anthropic API key
     """
     # Initialize Anthropic client
     client = Anthropic(api_key=api_key)
 
     # Get all image files from the process directory
-    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'}
     image_files = [
         f for f in process_dir.iterdir()
         if f.is_file() and f.suffix.lower() in image_extensions
@@ -141,18 +181,33 @@ def process_photos(process_dir: Path, renamed_dir: Path, api_key: str) -> None:
             # Sanitize the title for filename
             safe_title = sanitize_filename(movie_title)
 
-            # Create new filename with original extension
-            new_filename = f"{safe_title}{image_path.suffix}"
+            # Create new filename (always .jpg for renamed, keep original extension for backup)
+            new_filename = f"{safe_title}.jpg"
             new_path = renamed_dir / new_filename
 
-            # Handle duplicate filenames
+            # Handle duplicate filenames in renamed directory
             counter = 1
             while new_path.exists():
-                new_filename = f"{safe_title}_{counter}{image_path.suffix}"
+                new_filename = f"{safe_title}_{counter}.jpg"
                 new_path = renamed_dir / new_filename
                 counter += 1
 
-            # Move the file
+            # Copy original to original_images directory with same naming scheme
+            original_filename = f"{safe_title}{image_path.suffix}"
+            original_path = original_dir / original_filename
+
+            # Handle duplicate filenames in original directory
+            counter = 1
+            while original_path.exists():
+                original_filename = f"{safe_title}_{counter}{image_path.suffix}"
+                original_path = original_dir / original_filename
+                counter += 1
+
+            # Copy original file to original_images
+            shutil.copy2(image_path, original_path)
+            print(f"  Saved original as: {original_filename}")
+
+            # Move processed file to renamed directory
             image_path.rename(new_path)
             print(f"  Renamed to: {new_filename}\n")
 
@@ -174,21 +229,24 @@ def main():
     base_dir = Path(__file__).parent
     process_dir = base_dir / 'data' / 'process'
     renamed_dir = base_dir / 'data' / 'renamed'
+    original_dir = base_dir / 'data' / 'original_images'
 
     # Ensure directories exist
     process_dir.mkdir(parents=True, exist_ok=True)
     renamed_dir.mkdir(parents=True, exist_ok=True)
+    original_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("Blu-ray Photo Analyzer and Renamer")
     print("=" * 60)
     print(f"Process directory: {process_dir}")
     print(f"Renamed directory: {renamed_dir}")
+    print(f"Original images directory: {original_dir}")
     print("=" * 60)
     print()
 
     # Process all photos
-    process_photos(process_dir, renamed_dir, api_key)
+    process_photos(process_dir, renamed_dir, original_dir, api_key)
 
     print("=" * 60)
     print("Processing complete!")
